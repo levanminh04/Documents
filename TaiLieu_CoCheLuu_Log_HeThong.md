@@ -12,6 +12,8 @@
 9. [Kết Luận](#9-kết-luận)
 
 ---
+<img width="828" height="810" alt="image" src="https://github.com/user-attachments/assets/d4152acc-1eb8-457a-9225-23525fc18b48" />
+
 
 ## 1. Tổng Quan Về Logging
 
