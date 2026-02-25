@@ -56,7 +56,7 @@ Mỗi số nằm trong khoảng **[-1.0, +1.0]**, thể hiện biên độ (đ�
 import librosa
 y, sr = librosa.load("bai_nhac.mp3")
 # y là mảng numpy, sr là sample rate
-print(y.shape)   # (7938000,) - 7.9 triệu số
+print(y.shape)   # (3,969,000,) - 3.9 triệu số 3 × 60 × 22050 = 3,969,000
 print(sr)        # 22050 (librosa mặc định resamples về 22050)
 print(y[:5])     # [-0.002, 0.015, 0.031, 0.028, -0.003]
 ```
