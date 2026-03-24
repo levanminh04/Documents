@@ -172,6 +172,25 @@ Tuy nhiên, có thể hiểu sơ bộ:
 | **MFCC[3-5]** | Chi tiết hình dạng phổ bậc thấp | "Ngoại hình khuôn mặt: to/nhỏ, dài/tròn" |
 | **MFCC[6-12]** | Chi tiết phổ bậc cao — tinh tế hơn | "Chi tiết khuôn mặt: mắt, mũi, miệng" |
 
+Hệ số C1 (hay thường gọi là Spectral Slope) đại diện cho độ dốc của phổ.
+
+  - Giá trị C1 dương (> 0): Thường biểu thị năng lượng dịch chuyển nhiều hơn về phía tần số cao (âm thanh "sáng").
+
+  - Giá trị C1 âm (< 0): Biểu thị năng lượng tập trung ở tần số thấp (âm thanh "trầm/tối").
+
+Nếu C1 > 0: Năng lượng ở vùng tần số cao (bên phải) lớn hơn vùng tần số thấp (bên trái). Do đó, đường dốc tổng thể sẽ đi từ dưới bên trái lên trên bên phải. (phổ Mel)
+
+Nếu C1  < 0: Năng lượng ở vùng tần số thấp (bên trái) lớn hơn. Đường dốc sẽ đi từ trên bên trái xuống dưới bên phải (giống hệt như cái biểu đồ màu tím trong ảnh của bạn). (phổ Mel)
+hai nhạc cụ khác nhau có thể có C1 giống nhau nhưng hình dạng phổ khác hoàn toàn.
+
+1. Tại sao C1 giống nhau nhưng phổ lại khác?
+
+Hãy tưởng tượng C1 giống như độ dốc của một con đường từ điểm đầu đến điểm cuối:
+
+Nhạc cụ A: Có phổ đi xuống đều tăm tắp từ trái sang phải (như một cái cầu trượt thẳng).
+
+Nhạc cụ B: Có phổ uốn lượn, lúc đầu rất cao, giữa cực thấp, rồi cuối lại hơi cao một chút.
+
 **Phép so sánh tổng thể:** Hãy tưởng tượng bạn mô tả khuôn mặt một người bằng 13 con số. Số đầu tiên là "mặt tròn hay dài?", số thứ hai là "trán rộng hay hẹp?", dần dần đến chi tiết hơn như "mũi cao bao nhiêu?". Không ai đặt tên cho "tham số khuôn mặt số 7" — nhưng tổ hợp 13 số này đủ để phân biệt bạn với mọi người khác.
 
 ---
