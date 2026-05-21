@@ -111,14 +111,41 @@ FROM event_schema.event_sectors s
 WHERE tt.event_sector_id = s.id
   AND s.sector_type IN ('VIP_BOX', 'ACCESSIBLE');
 ```
+---
+
+## 2. Khái Niệm Cốt Lõi: Access Scope vs Inventory Mode
+
+Để phục vụ phát triển hệ thống và thiết lập sản phẩm chính xác, hệ thống Flash Ticket phân tách nghiệp vụ bán vé thông qua hai trục thuộc tính độc lập:
+
+### 2.1. Định nghĩa thuộc tính
+1. **Access Scope (Phạm vi vé):** Định nghĩa quyền tiếp cận không gian vật lý của vé.
+   - `EVENT`: Vé chung toàn bộ sự kiện. Không giới hạn trong bất kỳ khu vực khán đài nào.
+   - `SECTOR`: Vé bị giới hạn trong phạm vi một khán đài/khu vực vật lý cụ thể (khớp với trường `event_sector_id`).
+2. **Inventory Mode (Cách quản lý tồn kho):** Định nghĩa phương thức quản lý tồn kho và xác định chỗ.
+   - `QUANTITY`: Vé bán theo số lượng đơn thuần. Không có thông tin số ghế hay vị trí cố định. Tồn kho giảm dần theo số lượng (`quantity_available -= N`).
+   - `ASSIGNED_SEAT`: Vé bán theo vị trí ghế ngồi được chỉ định chính xác. Mỗi vé tương ứng với một dòng trạng thái ghế trong DB (`event_seat_inventory`). Người mua được tự chọn vị trí ghế trên sơ đồ canvas.
+
+### 2.2. Ma trận Tổ hợp Thực tế & Nghiệp vụ sử dụng
+
+Dưới đây là bảng chi tiết các tổ hợp cấu hình vé khả thi trong thực tế, giúp lập trình viên và người vận hành hiểu rõ hành vi hệ thống:
+
+| Tổ hợp | Access Scope | Inventory Mode | Loại khán đài (Sector Type) | Trạng thái hệ thống | Ví dụ thực tế | Cách quản lý tồn kho (Backend) | Giao diện hiển thị (FE Buyer) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **TH-1** | `EVENT` | `QUANTITY` | `null` (Không có) | ✅ Hợp lệ | - Vé hội chợ.<br>- Vé triển lãm tranh.<br>- Vé Liveshow ca nhạc ngoài trời không chia khu (vé GA). | Trừ trực tiếp counter số lượng trên bảng `ticket_types` (sử dụng `TicketInventoryCounterService`). | Ô nhập số lượng đơn giản (Quantity Selector). |
+| **TH-2** | `SECTOR` | `QUANTITY` | `STANDING` (Đứng tự do) | ✅ Hợp lệ | - Vé khu Fanzone sát sân khấu.<br>- Vé khu đứng tự do sát khán đài chính của lễ hội âm nhạc. | Trừ counter số lượng trên bảng `ticket_types`, validate tổng quota các vé không vượt quá `total_capacity` của khán đài STANDING. | Ô nhập số lượng đơn giản (Quantity Selector). |
+| **TH-3** | `SECTOR` | `ASSIGNED_SEAT` | `SEATED` (Ghế ngồi) | ✅ Hợp lệ | - Vé hàng ghế VIP khán đài A.<br>- Vé nhà hát kịch (ghế A-12).<br>- Vé rạp chiếu phim. | - Lock phân tán từng ghế qua Redisson.<br>- Chuyển trạng thái dòng ghế trong DB sang `RESERVED` / `SOLD`. | Hiển thị sơ đồ ghế (Seat Map Canvas) để khách tự click chọn vị trí. |
+| **TH-4** | `EVENT` | `ASSIGNED_SEAT` | `null` (Không có) | ❌ Bị chặn | *Không có* | Bị từ chối ngay khi tạo vé vì chọn ghế bắt buộc phải đi kèm sơ đồ khán đài cụ thể (`SECTOR`). | *Không hiển thị* |
+| **TH-5** | `SECTOR` | `ASSIGNED_SEAT` | `STANDING` (Đứng tự do) | ❌ Bị chặn | *Không có* | Bị từ chối vì khán đài đứng không có thực thể ghế vật lý để gán số ghế. | *Không hiển thị* |
+| **TH-6** | `SECTOR` | `QUANTITY` | `SEATED` (Ghế ngồi) | ❌ Bị chặn (MVP) | *Tạm chặn trong MVP* | Hệ thống từ chối nhằm ép buộc mọi vé trên khán đài có ghế ngồi vật lý vẽ sơ đồ đều phải bán qua chế độ chọn ghế (tránh tranh chấp ghế ngồi tự do). | *Không hiển thị* |
 
 ---
 
-## 2. Giao Diện & Trải Nghiệm Người Dùng (FE Contract)
+## 3. Giao Diện & Trải Nghiệm Người Dùng (FE Contract)
+
 
 Đặc tả hoạt động của Frontend trên các luồng nghiệp vụ:
 
-### 2.1. Organizer Portal (Quản lý thiết lập Event)
+### 3.1. Organizer Portal (Quản lý thiết lập Event)
 *   **Tạo/Sửa Vé (Ticket Type Wizard):**
     *   Trường chọn **Access Scope** gồm 2 tùy chọn: `Toàn sự kiện (EVENT)` và `Khán đài cụ thể (SECTOR)`.
     *   Nếu chọn `SECTOR` $\rightarrow$ Dynamic dropdown bắt buộc chọn một Sector đang Active thuộc Event.
@@ -129,7 +156,7 @@ WHERE tt.event_sector_id = s.id
         *   `SEATED`: Bắt buộc vẽ hoặc sinh các ghế vật lý có nhãn tọa độ.
         *   `STANDING`: Không cho phép sinh ghế. Bắt buộc nhập trường **Total Capacity** (Sức chứa tối đa của khu vực).
 
-### 2.2. Buyer Portal (Mua vé)
+### 3.2. Buyer Portal (Mua vé)
 *   **Trường hợp 1: Vé tự do (Access Scope = EVENT + Inventory Mode = QUANTITY hoặc Access Scope = SECTOR + SectorType = STANDING + Inventory Mode = QUANTITY)**
     *   Giao diện hiển thị nút tăng/giảm số lượng đơn giản (Quantity Selector).
     *   Payload gửi lên Booking API không chứa mảng `seatIds` (hoặc mảng rỗng).
@@ -141,9 +168,9 @@ WHERE tt.event_sector_id = s.id
 
 ---
 
-## 3. Quy Quy Trình Thiết Lập & Quy Tắc Ràng Buộc Khán Đài
+## 4. Quy Quy Trình Thiết Lập & Quy Tắc Ràng Buộc Khán Đài
 
-### 3.1. Giải quyết Vòng Lặp Thiết Lập (Sector vs TicketType)
+### 4.1. Giải quyết Vòng Lặp Thiết Lập (Sector vs TicketType)
 Để giải quyết mâu thuẫn "muốn vẽ sơ đồ cần chọn loại vé, muốn tạo loại vé cần liên kết sector", quy trình thiết lập được chuẩn hóa như sau:
 1.  **Bước 1 (Vẽ sơ đồ):** Organizer tạo Layout và vẽ các Sector vật lý trong Seat Map Editor. Gán `sector_type` (`SEATED` / `STANDING`), chưa cần gán `ticketTypeId` (để trống). Tiến hành lưu và Publish sơ đồ lần đầu $\rightarrow$ Hệ thống sinh UUID cho các Sector trong DB. Với khán đài `SEATED`, các record trong `event_seat_inventory` được tạo với `ticket_type_id = NULL` và `status = 'AVAILABLE'`.
 2.  **Bước 2 (Tạo vé):** Organizer vào danh sách Ticket Type, tạo các Ticket Type với cấu hình `accessScope = SECTOR` và chọn Sector tương ứng từ danh sách dropdown đã sinh ở Bước 1. Lúc này, DB ghi nhận `TicketType.eventSectorId = sectorId` làm **Source of Truth**.
@@ -160,20 +187,20 @@ WHERE tt.event_sector_id = s.id
     >
     > **Publish sau khi đã liên kết Ticket Type:** Nếu sơ đồ ghế được chỉnh sửa và Publish lại sau khi Ticket Type đã được liên kết với Sector, Backend khi tạo các ghế mới sinh ra trong DB sẽ tự động điền `ticket_type_id` bằng ID của Ticket Type đang liên kết với Sector đó.
 
-### 3.2. Giới Hạn Nghiệp Vụ MVP (Sector vs Ticket Type)
+### 4.2. Giới Hạn Nghiệp Vụ MVP (Sector vs Ticket Type)
 *   **MVP Constraint 1:** **Mỗi khán đài ghế ngồi (`SEATED` sector) chỉ được liên kết với tối đa 1 loại vé chọn chỗ (`ASSIGNED_SEAT` ticket type) ở trạng thái hoạt động (active).**
     *   *Ý nghĩa:* Ngăn chặn việc cấu hình nhiều giá vé khác nhau trong cùng một khán đài vật lý mà không có phân lớp hàng ghế trong MVP.
     *   *Giải pháp thay thế:* Nếu Organizer muốn cấu hình vé VIP ở các hàng đầu và Regular ở các hàng sau, họ phải vẽ tách thành 2 sector riêng biệt (ví dụ: `Khán đài A - VIP` và `Khán đài A - Regular`).
 *   **MVP Constraint 2 (Seated Quantity Derivation):** Khi Tạo hoặc Cập nhật Ticket Type có `inventoryMode = ASSIGNED_SEAT`, Backend sẽ **bỏ qua hoặc từ chối** trường `quantityTotal` gửi lên từ Client. Số lượng vé phát hành bắt buộc phải được lấy tự động từ số lượng ghế đang hoạt động của sector:
     $$\text{quantityTotal} = \text{event\_seats.count(isActive = true, sectorId = eventSectorId)}$$
 
-### 3.3. Ràng Buộc Đổi Loại Vé Liên Kết của Seated Sector
+### 4.3. Ràng Buộc Đổi Loại Vé Liên Kết của Seated Sector
 Để tránh làm sai lệch trạng thái ghế đã giữ hoặc đã bán của một sector khi thay đổi Ticket Type liên kết:
 *   **Quy tắc:** Trước khi thay đổi liên kết Ticket Type của một `SEATED` sector:
     *   Nếu trong `event_seat_inventory` của sector đó đã tồn tại bất kỳ ghế nào ở trạng thái `RESERVED` hoặc `SOLD` $\rightarrow$ Hệ thống lập tức từ chối và trả lỗi HTTP 400 (`"Không thể thay đổi loại vé của khán đài khi đã phát sinh vé đặt hoặc vé bán"`).
     *   Nếu toàn bộ ghế ở trạng thái `AVAILABLE` (hoặc `BLOCKED`, `NULL`) $\rightarrow$ Cho phép cập nhật lại `ticket_type_id` mới sang Ticket Type mới.
 
-### 3.4. Định Nghĩa và Ràng Buộc Sức Chứa (Capacity Rules)
+### 4.4. Định Nghĩa và Ràng Buộc Sức Chứa (Capacity Rules)
 
 #### A. Bản chất trường `events.total_capacity`
 *   Theo logic nghiệp vụ hiện có của Core Service (gọi qua `adjustTotalCapacity`), trường `events.total_capacity` được định nghĩa là **Tổng quota vé đã phát hành của tất cả các Ticket Type**.
@@ -200,7 +227,7 @@ WHERE tt.event_sector_id = s.id
         *   `TicketType.quantityAvailable = activeSeatCount - soldCount - reservedCount`
         *   `TicketType.quantityReserved = reservedCount`
 
-### 3.5. Ràng Buộc Sửa Đổi Khán Đài (Safe Mode Updates)
+### 4.5. Ràng Buộc Sửa Đổi Khán Đài (Safe Mode Updates)
 Khi thực hiện cập nhật hoặc sửa đổi khán đài đã được bán hoặc giữ vé, hệ thống áp dụng các chốt chặn sau:
 *   **Khi giảm Capacity của Standing Sector:** Hệ thống kiểm tra tổng lượng vé đã bán + đang giữ của tất cả các loại vé dùng chung sector đó:
     $$\text{newTotalCapacity} \ge \sum (\text{quantityTotal} - \text{quantityAvailable} \text{ của các TicketType thuộc Sector } X)$$
@@ -210,15 +237,15 @@ Khi thực hiện cập nhật hoặc sửa đổi khán đài đã được bá
 
 ---
 
-## 4. Ranh Giới Dịch Vụ Đếm Tồn Kho (TicketInventoryCounterService)
+## 5. Ranh Giới Dịch Vụ Đếm Tồn Kho (TicketInventoryCounterService)
 
 Dịch vụ `TicketInventoryCounterService` là cửa ngõ duy nhất thực hiện việc trừ, cộng và hoàn trả tồn kho số lượng trên bảng `ticket_types` (và `inventory_pools` trong tương lai).
 
-### 4.1. Quy tắc phân nhiệm (Single Update Rule)
+### 5.1. Quy tắc phân nhiệm (Single Update Rule)
 *   **Chỉ thực hiện trừ counter 1 lần duy nhất:** Việc trừ counter `quantity_available` và tăng `quantity_reserved` chỉ được gọi bởi `BookingService` thông qua `counterService.reserveCounter()` ở pha Orchestration chung (sau khi đã lock toàn bộ tài nguyên thành công nhưng trước khi tạo đơn hàng).
 *   **Chiến dịch Seated Reservation:** Khi gọi `seatBookingService.reserveSeats()`, hệ thống chỉ ghi nhận trạng thái dòng trong `event_seat_inventory` và chèn dữ liệu `order_item_seats`, **tuyệt đối không được tác động lại counter lần thứ hai**.
 
-### 4.2. Giao diện Counter Service
+### 5.2. Giao diện Counter Service
 ```java
 @Service
 @RequiredArgsConstructor
@@ -247,14 +274,14 @@ public class TicketInventoryCounterService {
 
 ---
 
-## 5. Ranh Giới Chiến Lược Giữ Chỗ & Khóa Toàn Cục (Lock Ordering)
+## 6. Ranh Giới Chiến Lược Giữ Chỗ & Khóa Toàn Cục (Lock Ordering)
 
 Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa trên `TicketType.inventoryMode`:
 
 *   `BookingService` chịu trách nhiệm mở rộng Transaction, điều phối gọi các pha của Strategy, gọi `TicketInventoryCounterService` và lưu thông tin `Order` gốc.
 *   Các Strategy tự quản lý cơ chế khóa (Lock), xác thực sau khóa (Pre-check), và lưu giữ chi tiết chỗ (Record). Không được thiết kế một phương thức `book()` tổng nuốt chửng cả luồng nghiệp vụ của `BookingService`.
 
-### 5.1. Cơ chế Khóa Toàn Cục Tránh Deadlock trên Mixed Order
+### 6.1. Cơ chế Khóa Toàn Cục Tránh Deadlock trên Mixed Order
 Để tránh hiện tượng deadlock/circular wait khi một đơn hàng chứa cả vé số lượng (Zone Lock) và vé chọn ghế (Seat Lock), chúng ta thiết lập cơ chế **Sắp xếp khóa toàn cục (Global Lock Ordering)**:
 1.  **Thu thập toàn bộ Lock Keys của Đơn hàng:**
     *   Với mỗi item đặt vé số lượng (Fanzone/GA): Tạo key `lock:zone:{ticketTypeId}`
@@ -267,9 +294,9 @@ Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa tr
 
 ---
 
-## 6. Đặc Tả API Contracts (Request & Response)
+## 7. Đặc Tả API Contracts (Request & Response)
 
-### 6.1. Tạo/Cập nhật Ticket Type (POST/PUT)
+### 7.1. Tạo/Cập nhật Ticket Type (POST/PUT)
 *   **API Endpoint:**
     *   `POST /api/organizer/events/{eventId}/ticket-types`
     *   `PUT /api/organizer/events/{eventId}/ticket-types/{ticketTypeId}`
@@ -286,7 +313,7 @@ Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa tr
 }
 ```
 
-### 6.2. DTO Response Contract
+### 7.2. DTO Response Contract
 *   **TicketTypeDTO (Public & Organizer):** Trả thêm các trường định dạng nghiệp vụ bán để Frontend quyết định hiển thị sơ đồ hoặc số lượng:
 ```json
 {
@@ -311,7 +338,7 @@ Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa tr
 }
 ```
 
-### 6.3. Publish Seat Map
+### 7.3. Publish Seat Map
 *   **API Endpoint:** `POST /api/organizer/events/{eventId}/seat-map/publish`
 *   **Request Body JSON:**
 ```json
@@ -337,7 +364,7 @@ Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa tr
 }
 ```
 
-### 6.4. Đặt vé (Create Booking)
+### 7.4. Đặt vé (Create Booking)
 *   **API Endpoint:** `POST /api/bookings`
 *   **Request Body JSON:**
 ```json
@@ -365,15 +392,15 @@ Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa tr
 
 ---
 
-## 7. Chi Tiết Cấu Hình Cache & Lock Phân Tán
+## 8. Chi Tiết Cấu Hình Cache & Lock Phân Tán
 
-### 7.1. Lock Spec (Phòng Deadlock & Livelock)
+### 8.1. Lock Spec (Phòng Deadlock & Livelock)
 *   **Lexicographical Sorting:** Trước khi acquire lock cho danh sách ghế, Java code bắt buộc phải sort danh sách `seatIds` theo thứ tự bảng chữ cái UUID string.
 *   **Wait & Lease Duration:**
     *   `waitTime = 100ms` (Tránh treo luồng Tomcat, chống flaky test do trễ mạng hoặc hạ tầng quá tải).
     *   `leaseTime = 15s` (Tự động giải phóng khóa nếu Node xử lý bị crash đột ngột).
 
-### 7.2. Cache Spec (Redisson RMapCache)
+### 8.2. Cache Spec (Redisson RMapCache)
 *   **Key Format:** `seat_status:{eventId}`
 *   **Kiểu dữ liệu:** `RMapCache<UUID, String>` (Key: Seat UUID, Value: Status String).
 *   **Status Values:** `AVAILABLE`, `RESERVED`, `SOLD`, `BLOCKED`.
@@ -388,12 +415,12 @@ Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa tr
 
 ---
 
-## 8. Vòng Đời Đơn Hàng & Ranh Giới Giao Dịch (Transaction Boundary)
+## 9. Vòng Đời Đơn Hàng & Ranh Giới Giao Dịch (Transaction Boundary)
 
-### 8.1. Ranh giới Transaction
+### 9.1. Ranh giới Transaction
 Toàn bộ quá trình xử lý đặt vé trong phương thức `BookingService.doBooking` phải chạy trong **cùng một DB Transaction**. Nếu bất kỳ bước nào thất bại, toàn bộ dữ liệu phải tự động rollback để đảm bảo tính nhất quán.
 
-### 8.2. Ma Trận Chuyển Đổi Trạng Thái Hệ Thống (State Machine)
+### 9.2. Ma Trận Chuyển Đổi Trạng thái Hệ Thống (State Machine)
 
 | Trạng thái Đơn hàng (`orders.status`) | Hành động trên Counter (`TicketType`) | Trạng thái Ghế DB (`event_seat_inventory`) | Trạng thái Ghế Cache (`Redis`) | Trạng thái Chi tiết Ghế (`order_item_seats.status`) |
 | :--- | :--- | :--- | :--- | :--- |
@@ -409,7 +436,7 @@ Toàn bộ quá trình xử lý đặt vé trong phương thức `BookingService
 
 ---
 
-## 9. Ma Trận Tương Thích & Chính Sách Xác Thực (CompatibilityPolicy)
+## 10. Ma Trận Tương Thích & Chính Sách Xác Thực (CompatibilityPolicy)
 
 Hệ thống chỉ hỗ trợ hai loại hình khu vực vật lý là `SEATED` và `STANDING` trong Phase B. Các loại hình phụ trợ được cấu hình từ trước sẽ bị loại bỏ hoặc tạm khóa tại tầng Backend.
 
@@ -426,16 +453,16 @@ Hệ thống chỉ hỗ trợ hai loại hình khu vực vật lý là `SEATED` 
 
 ---
 
-## 10. Cấu Trúc Bảng Ánh Xạ `order_item_seats` (Khớp V2 Schema)
+## 11. Cấu Trúc Bảng Ánh Xạ `order_item_seats` (Khớp V2 Schema)
 
 Việc ghi nhận chi tiết ghế đã đặt vào cơ sở dữ liệu phải tuân thủ chính xác 100% cấu trúc của bảng `booking_schema.order_item_seats` được khai báo trong file [V2__complete_schema.sql](file:///d:/Project/flash-ticket-system/database/postgresql/V2__complete_schema.sql):
 
-### 10.1. Giá Trị Cột Price (Giá thực tế trước discount)
+### 11.1. Giá Trị Cột Price (Giá thực tế trước discount)
 *   **Quy tắc:** Để tránh việc phân chia phần trăm giảm giá của Voucher/Promotion cho từng ghế đơn lẻ cực kỳ phức tạp và dễ gây sai số làm tròn số thập phân, giá trị cột `price` trong bảng `order_item_seats` được chốt:
     $$\text{order\_item\_seats.price} = \text{Giá bán gốc của loại vé (TicketType.price) trước khi giảm giá}$$
 *   Toàn bộ phần tiền khấu trừ của voucher/promotion sẽ được lưu trữ tập trung ở cấp độ Order (`orders.discount_amount`) hoặc Order Item (`order_items.discount_amount`).
 
-### 10.2. Thực thể Java Mapping (`OrderItemSeat.java`)
+### 11.2. Thực thể Java Mapping (`OrderItemSeat.java`)
 ```java
 @Entity
 @Table(name = "order_item_seats", schema = "booking_schema")
@@ -478,7 +505,7 @@ public class OrderItemSeat {
 
 ---
 
-## 11. Tiêu Chí Nghiệm Thu Kiến Trúc (Acceptance Criteria)
+## 12. Tiêu Chí Nghiệm Thu Kiến Trúc (Acceptance Criteria)
 
 Hệ thống phải vượt qua 4 bộ Acceptance Criteria dưới đây:
 
