@@ -120,7 +120,7 @@ WHERE tt.event_sector_id = s.id
 ### 2.1. Định nghĩa thuộc tính
 1. **Access Scope (Phạm vi vé):** Định nghĩa quyền tiếp cận không gian vật lý của vé.
    - `EVENT`: Vé chung toàn bộ sự kiện. Không giới hạn trong bất kỳ khu vực khán đài nào.
-   - `SECTOR`: Vé bị giới hạn trong phạm vi một khán đài/khu vực vật lý cụ thể (khớp với trường `event_sector_id`).
+   - `SECTOR`: Vé bị giới hạn trong phạm vi một khán đài/khu vực vật lý cụ thể (khớp với trường `ticket_types.event_sector_id` -- `null` nếu Access Scope là `EVENT`, UUID nếu là `SECTOR`).
 2. **Inventory Mode (Cách quản lý tồn kho):** Định nghĩa phương thức quản lý tồn kho và xác định chỗ.
    - `QUANTITY`: Vé bán theo số lượng đơn thuần. Không có thông tin số ghế hay vị trí cố định. Tồn kho giảm dần theo số lượng (`quantity_available -= N`).
    - `ASSIGNED_SEAT`: Vé bán theo vị trí ghế ngồi được chỉ định chính xác. Mỗi vé tương ứng với một dòng trạng thái ghế trong DB (`event_seat_inventory`). Người mua được tự chọn vị trí ghế trên sơ đồ canvas.
