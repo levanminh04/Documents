@@ -138,6 +138,23 @@ Dưới đây là bảng chi tiết các tổ hợp cấu hình vé khả thi tr
 | **TH-5** | `SECTOR` | `ASSIGNED_SEAT` | `STANDING` (Đứng tự do) | ❌ Bị chặn | *Không có* | Bị từ chối vì khán đài đứng không có thực thể ghế vật lý để gán số ghế. | *Không hiển thị* |
 | **TH-6** | `SECTOR` | `QUANTITY` | `SEATED` (Ghế ngồi) | ❌ Bị chặn (MVP) | *Tạm chặn trong MVP* | Hệ thống từ chối nhằm ép buộc mọi vé trên khán đài có ghế ngồi vật lý vẽ sơ đồ đều phải bán qua chế độ chọn ghế (tránh tranh chấp ghế ngồi tự do). | *Không hiển thị* |
 
+### 2.3. Nguyên tắc Suy diễn (Derived Access Scope)
+
+> [!IMPORTANT]
+> **`access_scope` là thuộc tính nội bộ của Backend, KHÔNG hiển thị trên giao diện Organizer.**
+> Organizer không bao giờ được yêu cầu chọn "EVENT" hay "SECTOR". Backend tự động suy ra giá trị này dựa trên việc Organizer có liên kết vé với một khán đài hay không.
+
+**Quy tắc suy diễn:**
+```java
+if (request.getEventSectorId() != null) {
+    ticketType.setAccessScope(AccessScope.SECTOR);
+} else {
+    ticketType.setAccessScope(AccessScope.EVENT);
+}
+```
+
+Điều này giải quyết triệt để trường hợp nhầm lẫn UX: Ví dụ, một nhà hát kịch chỉ có 1 khu vực ghế ngồi duy nhất. Organizer không cần phân vân chọn "EVENT" hay "SECTOR" — họ chỉ cần tạo sơ đồ, vẽ ghế, và tạo vé liên kết với khu vực đó. Backend tự động gán `access_scope = SECTOR`.
+
 ---
 
 ## 3. Giao Diện & Trải Nghiệm Người Dùng (FE Contract)
@@ -146,22 +163,53 @@ Dưới đây là bảng chi tiết các tổ hợp cấu hình vé khả thi tr
 Đặc tả hoạt động của Frontend trên các luồng nghiệp vụ:
 
 ### 3.1. Organizer Portal (Quản lý thiết lập Event)
-*   **Tạo/Sửa Vé (Ticket Type Wizard):**
-    *   Trường chọn **Access Scope** gồm 2 tùy chọn: `Toàn sự kiện (EVENT)` và `Khán đài cụ thể (SECTOR)`.
-    *   Nếu chọn `SECTOR` $\rightarrow$ Dynamic dropdown bắt buộc chọn một Sector đang Active thuộc Event.
-    *   Trường chọn **Inventory Mode** gồm 2 tùy chọn: `Mua theo số lượng (QUANTITY)` và `Chọn vị trí ghế (ASSIGNED_SEAT)`.
-    *   **Ràng buộc Seated Ticket:** Nếu chọn `ASSIGNED_SEAT`, trường nhập **Total Quantity** (Số lượng vé phát hành) sẽ bị khóa/read-only trên giao diện. Giá trị này sẽ được tự động tính và điền bởi hệ thống dựa trên số lượng ghế thực tế đang hoạt động của khán đài.
-*   **Thiết lập Sơ đồ (Seat Map Editor):**
-    *   Đối với mỗi Sector được vẽ trên Konva Canvas, Organizer chọn loại khu vực (`sector_type`):
-        *   `SEATED`: Bắt buộc vẽ hoặc sinh các ghế vật lý có nhãn tọa độ.
-        *   `STANDING`: Không cho phép sinh ghế. Bắt buộc nhập trường **Total Capacity** (Sức chứa tối đa của khu vực).
+
+#### A. Lựa chọn chính khi tạo Event (Event Setup Wizard)
+Organizer được hỏi **một câu duy nhất** khi thiết lập cấu hình bán vé cho sự kiện:
+
+> **"Bạn có cần sơ đồ khu vực hoặc ghế không?"**
+> 1. ○ **Không dùng sơ đồ** — Bán vé theo số lượng.
+> 2. ○ **Dùng sơ đồ** — Tạo khu đứng, khu tự do, khu ghế ngồi hoặc kết hợp.
+
+*   Nếu chọn **"Không dùng sơ đồ"**: Organizer chuyển thẳng sang form tạo Ticket Type. Không hiển thị Seat Map Editor. Backend tự gán `accessScope = EVENT`, `inventoryMode = QUANTITY`.
+*   Nếu chọn **"Dùng sơ đồ"**: Mở Seat Map Editor. Organizer vẽ từng khu vực (Sector) trên Konva Canvas.
+
+#### B. Thiết lập Sơ đồ (Seat Map Editor)
+Trong Seat Map Editor, đối với mỗi Sector, Organizer chọn loại khu vực:
+*   **Khu tự do / khu đứng** (`sectorType = STANDING`): Không sinh ghế vật lý. Bắt buộc nhập trường **Sức chứa tối đa** (`totalCapacity`).
+*   **Khu ghế ngồi** (`sectorType = SEATED`): Bắt buộc vẽ hoặc sinh các ghế vật lý có nhãn tọa độ.
+
+> [!NOTE]
+> **Mixed Event (Sự kiện hỗn hợp):** Không tồn tại lựa chọn "Mixed" trên giao diện. Khi Organizer tạo nhiều khu vực khác loại (ví dụ: 1 khu Fanzone đứng + 1 khán đài ghế ngồi), hệ thống tự động hiểu đây là sự kiện hỗn hợp. Backend không lưu trường `MIXED` làm source of truth.
+
+#### C. Tạo/Sửa Vé (Ticket Type Form)
+Sau khi sơ đồ được publish, Organizer tạo Ticket Type:
+*   Nếu Event **không dùng sơ đồ**: Form chỉ hiển thị các trường cơ bản (tên, giá, số lượng). Không hiển thị dropdown khán đài.
+*   Nếu Event **dùng sơ đồ**: Form bổ sung dropdown **"Thuộc khu vực nào?"** (danh sách Sector đang Active). Organizer bắt buộc chọn 1 khu vực.
+    *   Nếu khu vực được chọn là `STANDING` $\rightarrow$ Backend tự gán `inventoryMode = QUANTITY`.
+    *   Nếu khu vực được chọn là `SEATED` $\rightarrow$ Backend tự gán `inventoryMode = ASSIGNED_SEAT`. Trường **Số lượng vé** bị khóa (read-only), hệ thống tự động tính từ số ghế hoạt động.
+
+#### D. Bảng ánh xạ UX → Backend
+
+| Organizer chọn trên UI | `eventSectorId` | Backend tự gán `accessScope` | Backend tự gán `inventoryMode` |
+| :--- | :--- | :--- | :--- |
+| Không dùng sơ đồ | `null` | `EVENT` | `QUANTITY` |
+| Dùng sơ đồ → Khu tự do / khu đứng | `UUID` | `SECTOR` | `QUANTITY` |
+| Dùng sơ đồ → Khu ghế ngồi | `UUID` | `SECTOR` | `ASSIGNED_SEAT` |
+
+#### E. Template nhanh (Tùy chọn — Future Enhancement)
+Để tăng tốc trải nghiệm thiết lập, hệ thống có thể cung cấp các mẫu sơ đồ dựng sẵn:
+*   🎨 Triển lãm / Hội chợ (không sơ đồ)
+*   🎤 Concert có Fanzone + Khán đài ghế ngồi
+*   🎭 Rạp hát / Hội trường (1 khu ghế ngồi duy nhất)
+*   🏟️ Sân vận động (nhiều khán đài)
+
+Organizer chọn template để FE tạo sẵn cấu trúc ban đầu. Template chỉ là UI helper — Backend không lưu loại template, vẫn derive mọi thứ từ `eventSectorId` và `sectorType`.
 
 ### 3.2. Buyer Portal (Mua vé)
-*   **Trường hợp 1: Vé tự do (Access Scope = EVENT + Inventory Mode = QUANTITY hoặc Access Scope = SECTOR + SectorType = STANDING + Inventory Mode = QUANTITY)**
-    *   Giao diện hiển thị nút tăng/giảm số lượng đơn giản (Quantity Selector).
-    *   Payload gửi lên Booking API không chứa mảng `seatIds` (hoặc mảng rỗng).
-*   **Trường hợp 2: Vé chọn chỗ (Access Scope = SECTOR + SectorType = SEATED + Inventory Mode = ASSIGNED_SEAT)**
-    *   Hiển thị canvas sơ đồ ghế ngồi trực quan.
+Frontend Buyer **chỉ cần kiểm tra trường `inventoryMode`** trong DTO trả về để quyết định giao diện. Không cần biết `accessScope` hay `sectorType`.
+*   **Nếu `inventoryMode = QUANTITY`:** Hiển thị nút tăng/giảm số lượng đơn giản (Quantity Selector). Payload gửi lên Booking API không chứa mảng `seatIds` (hoặc mảng rỗng).
+*   **Nếu `inventoryMode = ASSIGNED_SEAT`:** Hiển thị canvas sơ đồ ghế ngồi trực quan.
     *   Các ghế có trạng thái từ Cache/DB là `RESERVED`, `SOLD` hoặc `BLOCKED` sẽ hiển thị màu xám khóa (disabled).
     *   Buyer click chọn tối đa `N` ghế (N = giới hạn vé tối đa mỗi đơn hàng).
     *   Payload gửi lên Booking API bắt buộc có mảng `seatIds` có chiều dài bằng đúng trường `quantity`.
