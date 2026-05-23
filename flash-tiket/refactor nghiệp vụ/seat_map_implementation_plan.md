@@ -9,7 +9,7 @@
 
 ## Assumptions
 
-1. DB schema nâng cấp: Cập nhật `V2__complete_schema.sql` (cho fresh DB) và tạo `V7__add_ticket_type_fields.sql` (cho existing DB) để đưa `inventory_mode` và `access_scope` thành các cột thực vật lý.
+1. DB schema nâng cấp: Cập nhật `V2__complete_schema.sql` (cho fresh DB), tạo `V7__add_ticket_type_fields.sql` (cho existing DB) để đưa `inventory_mode`/`access_scope` thành cột thực, và tạo `V8__add_event_seat_ticket_type.sql` để hỗ trợ gán TicketType theo từng ghế trong SEATED sector.
 2. Tạo thêm `TicketInventoryCounterService` làm boundary bảo vệ counter.
 3. Tạo thêm `CompatibilityPolicy` làm ma trận check logic.
 4. `SeatBookingService` và các strategy triển khai đúng interface `InventoryReservationStrategy` tách biệt 2 pha: `precheckAfterLocks` và `recordReservation`.
@@ -87,7 +87,7 @@ Thêm:
   @Query(value = """
       INSERT INTO event_schema.event_seat_inventory
           (id, event_id, event_seat_id, ticket_type_id, status, created_at, updated_at)
-      SELECT uuid_generate_v4(), :eventId, s.id, :ticketTypeId, 'AVAILABLE', NOW(), NOW()
+      SELECT uuid_generate_v4(), :eventId, s.id, s.ticket_type_id, 'AVAILABLE', NOW(), NOW()
       FROM event_schema.event_seats s
       WHERE s.sector_id = :sectorId AND s.is_active = true
         AND NOT EXISTS (
@@ -95,16 +95,19 @@ Thêm:
             WHERE i.event_seat_id = s.id AND i.event_id = :eventId
         )
       """, nativeQuery = true)
-  int bulkInsertInventoryForSector(UUID eventId, UUID sectorId, UUID ticketTypeId);
+  int bulkInsertInventoryForSector(UUID eventId, UUID sectorId);
 
 [SAFETY] Atomic conditional UPDATE (chỉ update khi vẫn AVAILABLE):
   @Modifying
   @Query(value = """
       UPDATE event_schema.event_seat_inventory
       SET status = 'RESERVED', order_id = :orderId, updated_at = NOW()
-      WHERE event_seat_id = :seatId AND event_id = :eventId AND status = 'AVAILABLE'
+      WHERE event_seat_id = :seatId
+        AND event_id = :eventId
+        AND ticket_type_id = :ticketTypeId
+        AND status = 'AVAILABLE'
       """, nativeQuery = true)
-  int reserveSeatIfAvailable(UUID seatId, UUID eventId, UUID orderId);
+  int reserveSeatIfAvailable(UUID seatId, UUID eventId, UUID ticketTypeId, UUID orderId);
   -- Trả về 0 nếu ghế không còn AVAILABLE → báo lỗi oversell ngay
 
 → verify: compile OK
@@ -114,6 +117,20 @@ Thêm:
 ```
 Sửa: EventSeatInventory.java
 Thêm: @Column(name = "ticket_type_id") private UUID ticketTypeId;
+→ verify: Hibernate startup không báo schema mismatch
+```
+
+### A4b. EventSeat entity — map ticketTypeId + colorCode
+```
+Sửa: EventSeat.java
+Thêm:
+  @Column(name = "ticket_type_id") private UUID ticketTypeId;
+  @Column(name = "color_code", length = 7) private String colorCode;
+
+Ý nghĩa:
+  event_seats.ticket_type_id = source of truth ghế thuộc TicketType/vùng giá nào.
+  event_seat_inventory.ticket_type_id = snapshot để booking validate nhanh.
+  colorCode chỉ phục vụ FE render, không dùng cho booking validation.
 → verify: Hibernate startup không báo schema mismatch
 ```
 
@@ -160,7 +177,8 @@ publishSeatMap(UUID eventId, SeatMapPublishRequest payload, String organizerId):
   Bước 2: Validate payload
     - Duplicate sectorId/seatId → 400
     - Duplicate (sector, row, seatNumber) → 400
-    - Bỏ qua mapData.ticketTypeId từ payload FE gửi lên (ghi đè bằng DB value ở bước sau)
+    - Bỏ qua `event_sectors.mapData.ticketTypeId` nếu FE cũ còn gửi lên.
+      TicketType của ghế phải lấy từ per-seat `seat.ticketTypeId`.
 
   Classify: toInsert/toUpdate/toHide/toDelete cho sectors và seats
 
@@ -180,19 +198,18 @@ publishSeatMap(UUID eventId, SeatMapPublishRequest payload, String organizerId):
     (tương tự cho seats)
 
     Xử lý điền ticket_type_id (Chỉ áp dụng cho SEATED sector):
-      Truy vấn DB lấy các TicketType liên kết với sectorId.
-      Nếu có TicketType liên kết:
-        - Trước khi cập nhật: Validate nếu sector đã có vé RESERVED/SOLD thuộc ticket type khác → 400
-        - Với các ghế mới tạo (inserted): insert `event_seat_inventory` với `ticket_type_id = ticketTypeId`
-        - Đối với update: Đảm bảo không thay đổi liên kết ticketTypeId của ghế có status RESERVED/SOLD.
-      Nếu chưa có TicketType liên kết:
-        - Insert `event_seat_inventory` với `ticket_type_id = NULL`
+      - Không đọc `event_sectors.mapData.ticketTypeId` làm source of truth.
+      - Với từng ghế SEATED, lưu `seat.ticketTypeId` vào `event_seats.ticket_type_id`.
+      - Validate `seat.ticketTypeId` thuộc TicketType active của cùng event và cùng sector.
+      - Nếu ghế đang RESERVED/SOLD thì không cho đổi `event_seats.ticket_type_id`.
+      - Nếu ghế AVAILABLE/BLOCKED/null inventory thì cho đổi và sync snapshot sang `event_seat_inventory.ticket_type_id`.
+      - Trước khi mở bán, mọi ghế active trong SEATED sector phải có ticketTypeId hợp lệ.
 
     [PERF] Bulk INSERT inventory for all active SEATED sectors in layout (chèn ghế mới):
       for each active SEATED sectorId in layout:
-        bulkInsertInventoryForSector(eventId, sectorId, dbLinkedTicketTypeIdOrNull)
-        -- SQL SQL: INSERT INTO event_seat_inventory (event_id, event_seat_id, ticket_type_id, status)
-        -- SELECT :eventId, s.id, :ticketTypeId, 'AVAILABLE' FROM event_seats s
+        bulkInsertInventoryForSector(eventId, sectorId)
+        -- SQL: INSERT INTO event_seat_inventory (event_id, event_seat_id, ticket_type_id, status)
+        -- SELECT :eventId, s.id, s.ticket_type_id, 'AVAILABLE' FROM event_seats s
         -- WHERE s.sector_id = :sectorId AND s.is_active = true
         -- AND NOT EXISTS (SELECT 1 FROM event_seat_inventory esi WHERE esi.event_seat_id = s.id)
 
@@ -222,8 +239,17 @@ Thêm: @GetMapping("/{idOrSlug}/seat-map") Auth: permitAll
 ### A9. TicketTypeDTO (public & organizer) — thêm fields
 ```
 Sửa: TicketTypeDTO.java (public buyer-facing DTO) và các Mapper
-Thêm: UUID eventSectorId, InventoryMode inventoryMode, AccessScope accessScope
+Thêm: UUID eventSectorId, InventoryMode inventoryMode, AccessScope accessScope, String colorCode
 Lý do: Cần thiết để FE Buyer phân biệt được luồng số lượng hay chọn ghế trên sơ đồ.
+
+Sửa thêm SeatMapResponse/Seat DTO:
+  - Thêm `ticketTypeId`
+  - Thêm `price`
+  - Thêm `colorCode`
+
+Sửa SeatMapPublishRequest.SeatPayload:
+  - Nhận per-seat `ticketTypeId`
+  - Nhận per-seat `colorCode`
 ```
 
 
@@ -239,20 +265,22 @@ Sửa: TicketTypeService.java — createTicketType() và updateTicketType()
 
 2. Xử lý nghiệp vụ ASSIGNED_SEAT:
    if (req.inventoryMode() == InventoryMode.ASSIGNED_SEAT) {
-       // Validate 1: Chỉ cho phép tối đa 1 TicketType ASSIGNED_SEAT ở trạng thái ACTIVE trên mỗi sector
-       boolean exists = ticketTypeRepository.existsByEventSectorIdAndInventoryModeAndStatus(
-           eventSectorId, InventoryMode.ASSIGNED_SEAT, TicketTypeStatus.ACTIVE
-       );
-       // (nếu là update thì loại trừ current ticket type ID)
-       if (exists) throw new InvalidRequestException("Khán đài ngồi đã được liên kết với một loại vé chọn chỗ khác.");
+       // Validate 1: eventSectorId bắt buộc và sectorType phải là SEATED
+       if (eventSectorId == null || sector.getSectorType() != SEATED) throw 400;
 
-       // Validate 2: Đọc số lượng ghế hoạt động thực tế từ DB để làm quantityTotal
-       int activeSeats = eventSeatRepository.countBySectorIdAndIsActiveTrue(eventSectorId);
+       // Validate 2: Cho phép nhiều ASSIGNED_SEAT TicketType trong cùng SEATED sector.
+       // TicketType đóng vai trò vùng giá/hạng ghế trong MVP.
+
+       // Validate 3: Đọc số lượng ghế active đang gán vào ticket type hiện tại để làm quantityTotal.
+       int activeSeats = eventSeatRepository.countByTicketTypeIdAndIsActiveTrue(ticketTypeId);
+       int soldCount = eventSeatInventoryRepository.countByTicketTypeIdAndStatus(ticketTypeId, "SOLD");
+       int reservedCount = eventSeatInventoryRepository.countByTicketTypeIdAndStatus(ticketTypeId, "RESERVED");
        
-       // Override / Ghi đè các trường tồn kho trong Entity trước khi lưu:
+       // Override / Ghi đè các trường tồn kho trong Entity trước khi lưu.
+       // Với create mới, activeSeats có thể = 0 cho đến khi organizer gán ghế vào TicketType trên seat map.
        ticketType.setQuantityTotal(activeSeats);
-       ticketType.setQuantityAvailable(activeSeats);
-       ticketType.setQuantityReserved(0);
+       ticketType.setQuantityAvailable(activeSeats - soldCount - reservedCount);
+       ticketType.setQuantityReserved(reservedCount);
    }
 
 3. Đồng bộ tương thích ngược (Backward Compatibility):
@@ -261,8 +289,9 @@ Sửa: TicketTypeService.java — createTicketType() và updateTicketType()
 Lý do: Chặn organizer cấu hình sai, tự động tính toán quota dựa trên sơ đồ ghế vật lý.
 → verify: 
   - Gán sector event khác → 400
-  - Cấu hình 2 vé ASSIGNED_SEAT cho 1 sector → 400
-  - Tạo vé ASSIGNED_SEAT có quantityTotal khác số ghế active → Tự động override theo số ghế
+  - Cấu hình ASSIGNED_SEAT cho STANDING sector → 400
+  - Cấu hình nhiều ASSIGNED_SEAT ticket type trong cùng SEATED sector → OK
+  - Tạo/sửa vé ASSIGNED_SEAT có quantityTotal khác số ghế active gán vào ticket type → Tự động override theo số ghế
 ```
 
 
@@ -305,7 +334,7 @@ Tạo: public List<RLock> acquireGlobalLocks(UUID eventId, List<BookingItem> ite
     }
     return acquiredLocks;
 
-Lý do: Đảm bảo không xảy ra Deadlock / Livelock giữa các luồng đặt vé đứng (Zone) và vé ngồi (Seat) trong các Mixed Order.
+Lý do: Phase B reject mixed-zone order, nhưng vẫn cần tránh Deadlock / Livelock khi một request seated khóa nhiều ghế, và giữ nền tảng mở rộng nếu sau này cho cart nhiều zone.
 → verify: acquireGlobalLocks regression PASS
 ```
 
@@ -331,13 +360,15 @@ Tạo: SeatBookingService.java
 
 validateSeatedItems(seatIds, ticketTypeId, eventId, userId)
   - Mỗi seatId: tồn tại, isActive=true, đúng event, đúng ticketType
+  - Verify `event_seats.ticket_type_id == ticketTypeId`
+  - Verify snapshot `event_seat_inventory.ticket_type_id == ticketTypeId`
   - Không trùng seatId trong 1 order
   - inventoryStatus == AVAILABLE (post-lock double-check)
 
 reserveSeats(seatIds, orderId, orderItemId, ticketTypeId, eventId)
   *** Gọi SAU KHI orderId và orderItemId đã có ***
   (a) Atomic conditional UPDATE per seat (A3):
-      int updated = inventoryRepo.reserveSeatIfAvailable(seatId, eventId, orderId)
+      int updated = inventoryRepo.reserveSeatIfAvailable(seatId, eventId, ticketTypeId, orderId)
       if (updated == 0) throw oversell exception
       Nếu bất kỳ ghế nào fail → rollback (trong @Transactional)
   (b) Insert OrderItemSeat per seatId (B0)
@@ -366,10 +397,18 @@ private final SeatBookingService seatBookingService;
 private final TicketReservationService ticketReservationService;
 
 // (b) buildAndValidateContexts() — thay throw "not supported":
+validateSingleBookingZone(contexts);
+
 if (ctx.ticketType().getInventoryMode() == InventoryMode.ASSIGNED_SEAT) {
     if (seatIds == null || seatIds.size() != quantity)
         throw new InvalidRequestException("Số ghế phải khớp số lượng vé");
 }
+
+// validateSingleBookingZone():
+// - Phase B chỉ cho phép 1 booking request thuộc 1 vùng bán.
+// - Reject nếu trộn EVENT-level + SECTOR-level.
+// - Reject nếu request chứa nhiều eventSectorId khác nhau.
+// - Reject nếu trộn STANDING sector và SEATED sector trong cùng order.
 
 // (c) doBooking() — THÊM seated branch với thứ tự đúng:
 List<RLock> acquiredLocks = new ArrayList<>();
@@ -457,6 +496,9 @@ Anti double-count:
     *   Nếu chọn `SECTOR`, hiển thị dynamic dropdown lấy danh sách Sector đang active của event.
     *   Thêm trường select **Inventory Mode** (`QUANTITY` / `ASSIGNED_SEAT`).
     *   Validate trên client: Nếu chọn sector có loại `STANDING` $\rightarrow$ Khóa trường chọn vị trí ghế và ép về `QUANTITY`.
+    *   Với sector `SEATED`, cho phép tạo nhiều TicketType `ASSIGNED_SEAT` trong cùng một sector. Mỗi TicketType là một vùng giá/hạng ghế.
+    *   Với TicketType `ASSIGNED_SEAT`, trường số lượng phải read-only và lấy từ số ghế active đang gán vào TicketType đó.
+    *   Thêm `colorCode` cho TicketType để FE tô màu ghế theo vùng giá.
 
 ### FE2. Seat Map Editor (Organizer Canvas)
 *   **Mô tả:** Chỉnh sửa thuộc tính của Sector trên Konva Canvas.
@@ -465,6 +507,12 @@ Anti double-count:
         *   Chọn `sectorType` (`SEATED` / `STANDING`).
         *   Nếu chọn `STANDING`: Hiển thị trường nhập số **Sức chứa tối đa (Total Capacity)**, ẩn toàn bộ chức năng vẽ ghế vật lý.
         *   Nếu chọn `SEATED`: Ẩn trường nhập Capacity (tự động tính bằng số ghế vật lý vẽ trên canvas), hiển thị bảng cấu hình hàng ghế.
+    *   Với `SEATED`, bổ sung tool gán ghế vào TicketType:
+        *   Organizer chọn TicketType/vùng giá, rồi click/drag chọn ghế để gán `seat.ticketTypeId`.
+        *   Ghế lấy màu từ `ticketTypes.colorCode` hoặc snapshot `seat.colorCode`.
+        *   Payload publish phải gửi per-seat `ticketTypeId` và `colorCode`.
+        *   Không dùng `sector.mapData.ticketTypeId` làm source of truth vì một sector có thể có nhiều TicketType.
+        *   Chặn publish nếu còn ghế active trong SEATED sector chưa có `ticketTypeId`.
     *   Bảo toàn thuộc tính `isActive` khi ẩn/xóa ghế (`seat.isActive = false`) thay vì xóa cứng.
 
 ### FE3. Flow Mua Vé (Buyer Booking Flow)
@@ -473,6 +521,7 @@ Anti double-count:
     *   Buyer xem danh sách vé: Đọc `inventoryMode` và `accessScope`.
     *   Nếu `inventoryMode == 'QUANTITY'`: Hiển thị ô chọn số lượng vé (Quantity Selector).
     *   Nếu `inventoryMode == 'ASSIGNED_SEAT'`: Khi buyer chọn vé $\rightarrow$ Mở popup hiển thị Sơ đồ ghế (Seat Map Canvas), cho phép click trực tiếp để chọn vị trí ghế (truyền `seatIds` vào Payload booking).
+    *   Phase B: Chỉ cho phép giỏ hàng/booking request thuộc một vùng bán. Nếu buyer đã chọn vé ở một sector, UI không cho thêm vé từ sector khác hoặc EVENT-level ticket vào cùng checkout.
 
 ### FE4. Trang Checkout & Chi Tiết Đơn Hàng (Order Detail)
 *   **Mô tả:** Hiển thị thông tin ghế đã chọn.
@@ -520,8 +569,10 @@ Anti double-count:
 ## Thứ Tự Thực Hiện
 
 ```
+DB0                       (apply V7 + V8 cho database hiện hữu; V2 dùng cho fresh DB)
 A0                        (config — 5 phút, làm đầu)
 A1 → A2 → A3 → A4        (Repository/Entity)
+A4b                       (EventSeat.ticketTypeId + colorCode)
 A5(a,b,c)                 (SeatMapSyncService — cần A1, A2)
 A6                         (publishSeatMap — cần A1–A5)
 A7 → A8                   (Controller)
@@ -556,9 +607,11 @@ FE1 + FE2 + FE3
 | Xóa ghế SOLD/RESERVED | A6 — Chốt 1 |
 | Xóa sector có vé | A6 — Chốt 2 |
 | Ẩn sector/seat | A6 — `setIsActive(false)` (không có `setVisible`) |
-| Đổi ticketType sector có RESERVED | Chặn đổi ticket_type_id của ghế khi status là RESERVED/SOLD |
-| Đổi ticketType sector chỉ AVAILABLE | Update ticket_type_id qua Ticket Type save listener |
+| Đổi TicketType của ghế có RESERVED/SOLD | Chặn đổi `event_seats.ticket_type_id` |
+| Đổi TicketType của ghế chỉ AVAILABLE/BLOCKED | Cho đổi và sync snapshot `event_seat_inventory.ticket_type_id` |
 | ticketTypeId thuộc event khác | A10 (validation lúc save Ticket Type) |
+| Ghế active SEATED chưa gán ticketTypeId | A6/A10 — reject publish hoặc sale-readiness |
+| Một SEATED sector có nhiều ASSIGNED_SEAT TicketType | Hợp lệ — phân biệt bằng `event_seats.ticket_type_id`, không dùng `sector.mapData.ticketTypeId` |
 | Hidden seat mất khi reload | A5b + FE2 |
 | FE nuốt lỗi 400 | FE1 |
 | IDOR getSeatMap | A5a + `findByIdAndOrganizerIdAndIsDeletedFalse` [VERIFIED] |
@@ -572,7 +625,7 @@ FE1 + FE2 + FE3
 | Throughput thấp flash sale | B1 waitTime = 100ms (§8.2) |
 | Hot read seat status | A5c + A6 Redis HSET cache (§9) |
 | saveAll() chậm | A0 + A3 bulk SQL |
-| Mixed order (zone + seated) | B5 — 2 restore method độc lập + B1 Global Lock Ordering |
+| Mixed order / nhiều zone trong cùng booking | B3 — Phase B reject bằng `validateSingleBookingZone()` |
 | Buyer đọc DRAFT | A5c check PUBLISHED |
 | Redis chết | A5c fallback DB + re-warm |
 | DB-Redis lệch | DB = source of truth |
@@ -582,4 +635,3 @@ FE1 + FE2 + FE3
 | FE poll sau publish thành công | FE3 — dùng response trực tiếp |
 | Fresh setup Flyway fail | Fix: V2 FK constraints ở cuối file, V7 bọc DO $$ IF NOT EXISTS |
 | Seated quantity nhập sai | A10 override từ active seats count, FE read-only |
-

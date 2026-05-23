@@ -41,6 +41,18 @@ Cập nhật trực tiếp file [V2__complete_schema.sql](file:///d:/Project/fla
     );
     ```
 
+*   **Tại bảng `event_schema.event_seats`:**
+    ```sql
+    CREATE TABLE event_schema.event_seats (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        sector_id UUID NOT NULL REFERENCES event_schema.event_sectors(id) ON DELETE CASCADE,
+        ticket_type_id UUID REFERENCES event_schema.ticket_types(id) ON DELETE SET NULL,
+        -- ...
+        color_code VARCHAR(7)
+    );
+    ```
+    `event_seats.ticket_type_id` là source of truth cho việc một ghế trong khán đài ngồi đang thuộc Ticket Type/vùng giá nào. `event_seat_inventory.ticket_type_id` chỉ là snapshot để booking validate nhanh. `event_seats.color_code` là helper hiển thị cho FE, không dùng trong booking validation.
+
 *   **Tại cuối file `V2__complete_schema.sql`:**
     ```sql
     ALTER TABLE event_schema.ticket_types 
@@ -111,6 +123,23 @@ FROM event_schema.event_sectors s
 WHERE tt.event_sector_id = s.id
   AND s.sector_type IN ('VIP_BOX', 'ACCESSIBLE');
 ```
+
+Tạo thêm file migration `database/postgresql/V8__add_event_seat_ticket_type.sql` cho database thật:
+```sql
+ALTER TABLE event_schema.event_seats
+    ADD COLUMN IF NOT EXISTS ticket_type_id UUID,
+    ADD COLUMN IF NOT EXISTS color_code VARCHAR(7);
+
+ALTER TABLE event_schema.event_seats
+    ADD CONSTRAINT fk_event_seats_ticket_type_id
+    FOREIGN KEY (ticket_type_id)
+    REFERENCES event_schema.ticket_types(id)
+    ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_event_seats_ticket_type
+    ON event_schema.event_seats(ticket_type_id);
+```
+Khi chạy trên DB thật, constraint phải được bọc `DO $$ ... IF NOT EXISTS ... END $$` như file migration thực tế để tránh lỗi chạy lại.
 ---
 
 ## 2. Khái Niệm Cốt Lõi: Access Scope vs Inventory Mode
@@ -120,7 +149,7 @@ WHERE tt.event_sector_id = s.id
 ### 2.1. Định nghĩa thuộc tính
 1. **Access Scope (Phạm vi vé):** Định nghĩa quyền tiếp cận không gian vật lý của vé.
    - `EVENT`: Vé chung toàn bộ sự kiện. Không giới hạn trong bất kỳ khu vực khán đài nào.
-   - `SECTOR`: Vé bị giới hạn trong phạm vi một khán đài/khu vực vật lý cụ thể (khớp với trường `ticket_types.event_sector_id` -- `null` nếu Access Scope là `EVENT`, UUID nếu là `SECTOR`).
+   - `SECTOR`: Vé bị giới hạn trong phạm vi một khán đài/khu vực vật lý cụ thể (khớp với trường `event_sector_id`).
 2. **Inventory Mode (Cách quản lý tồn kho):** Định nghĩa phương thức quản lý tồn kho và xác định chỗ.
    - `QUANTITY`: Vé bán theo số lượng đơn thuần. Không có thông tin số ghế hay vị trí cố định. Tồn kho giảm dần theo số lượng (`quantity_available -= N`).
    - `ASSIGNED_SEAT`: Vé bán theo vị trí ghế ngồi được chỉ định chính xác. Mỗi vé tương ứng với một dòng trạng thái ghế trong DB (`event_seat_inventory`). Người mua được tự chọn vị trí ghế trên sơ đồ canvas.
@@ -187,7 +216,8 @@ Sau khi sơ đồ được publish, Organizer tạo Ticket Type:
 *   Nếu Event **không dùng sơ đồ**: Form chỉ hiển thị các trường cơ bản (tên, giá, số lượng). Không hiển thị dropdown khán đài.
 *   Nếu Event **dùng sơ đồ**: Form bổ sung dropdown **"Thuộc khu vực nào?"** (danh sách Sector đang Active). Organizer bắt buộc chọn 1 khu vực.
     *   Nếu khu vực được chọn là `STANDING` $\rightarrow$ Backend tự gán `inventoryMode = QUANTITY`.
-    *   Nếu khu vực được chọn là `SEATED` $\rightarrow$ Backend tự gán `inventoryMode = ASSIGNED_SEAT`. Trường **Số lượng vé** bị khóa (read-only), hệ thống tự động tính từ số ghế hoạt động.
+    *   Nếu khu vực được chọn là `SEATED` $\rightarrow$ Backend tự gán `inventoryMode = ASSIGNED_SEAT`. Organizer có thể tạo nhiều Ticket Type trong cùng một khán đài ngồi để đại diện cho các vùng giá/hạng ghế khác nhau (ví dụ VIP, Regular, Balcony). Trường **Số lượng vé** bị khóa (read-only), hệ thống tự động tính từ số ghế active đang gán vào Ticket Type đó.
+    *   Mỗi Ticket Type nên có `colorCode`; FE dùng màu này để tô các ghế đang gán với Ticket Type. `event_seats.color_code` chỉ là snapshot/helper để lần sau reload map nhanh và nhất quán.
 
 #### D. Bảng ánh xạ UX → Backend
 
@@ -210,9 +240,11 @@ Organizer chọn template để FE tạo sẵn cấu trúc ban đầu. Template 
 Frontend Buyer **chỉ cần kiểm tra trường `inventoryMode`** trong DTO trả về để quyết định giao diện. Không cần biết `accessScope` hay `sectorType`.
 *   **Nếu `inventoryMode = QUANTITY`:** Hiển thị nút tăng/giảm số lượng đơn giản (Quantity Selector). Payload gửi lên Booking API không chứa mảng `seatIds` (hoặc mảng rỗng).
 *   **Nếu `inventoryMode = ASSIGNED_SEAT`:** Hiển thị canvas sơ đồ ghế ngồi trực quan.
+    *   Mỗi ghế trả về `ticketTypeId`, `price` và `colorCode` để FE biết ghế đó thuộc hạng vé nào và tô màu đúng.
     *   Các ghế có trạng thái từ Cache/DB là `RESERVED`, `SOLD` hoặc `BLOCKED` sẽ hiển thị màu xám khóa (disabled).
     *   Buyer click chọn tối đa `N` ghế (N = giới hạn vé tối đa mỗi đơn hàng).
     *   Payload gửi lên Booking API bắt buộc có mảng `seatIds` có chiều dài bằng đúng trường `quantity`.
+    *   Trong một request đặt vé, MVP chỉ cho phép các item thuộc cùng một vùng bán (`eventSectorId`/zone) để giảm độ phức tạp orchestration và tránh order mixed-zone trong Phase B.
 
 ---
 
@@ -220,33 +252,39 @@ Frontend Buyer **chỉ cần kiểm tra trường `inventoryMode`** trong DTO tr
 
 ### 4.1. Giải quyết Vòng Lặp Thiết Lập (Sector vs TicketType)
 Để giải quyết mâu thuẫn "muốn vẽ sơ đồ cần chọn loại vé, muốn tạo loại vé cần liên kết sector", quy trình thiết lập được chuẩn hóa như sau:
-1.  **Bước 1 (Vẽ sơ đồ):** Organizer tạo Layout và vẽ các Sector vật lý trong Seat Map Editor. Gán `sector_type` (`SEATED` / `STANDING`), chưa cần gán `ticketTypeId` (để trống). Tiến hành lưu và Publish sơ đồ lần đầu $\rightarrow$ Hệ thống sinh UUID cho các Sector trong DB. Với khán đài `SEATED`, các record trong `event_seat_inventory` được tạo với `ticket_type_id = NULL` và `status = 'AVAILABLE'`.
-2.  **Bước 2 (Tạo vé):** Organizer vào danh sách Ticket Type, tạo các Ticket Type với cấu hình `accessScope = SECTOR` và chọn Sector tương ứng từ danh sách dropdown đã sinh ở Bước 1. Lúc này, DB ghi nhận `TicketType.eventSectorId = sectorId` làm **Source of Truth**.
-3.  **Bước 3 (Auto-Sync khi liên kết):** Sau khi Ticket Type được lưu, hệ thống tự động chạy câu lệnh SQL để cập nhật giá trị `ticket_type_id` trong bảng `event_seat_inventory` đối với các ghế chưa bán hoặc đang khóa vật lý thuộc Sector đó:
+1.  **Bước 1 (Vẽ sơ đồ):** Organizer tạo Layout và vẽ các Sector vật lý trong Seat Map Editor. Gán `sector_type` (`SEATED` / `STANDING`). Với `SEATED`, có thể tạo ghế trước và để `ticketTypeId = NULL` trong giai đoạn draft.
+2.  **Bước 2 (Tạo vé):** Organizer tạo một hoặc nhiều Ticket Type liên kết với Sector. Với `SEATED`, mỗi Ticket Type đại diện cho một vùng giá/hạng ghế trong sector đó (ví dụ VIP, Regular). `TicketType.eventSectorId = sectorId` cho biết Ticket Type thuộc khán đài nào, nhưng không còn nghĩa là toàn bộ sector chỉ có một Ticket Type.
+3.  **Bước 3 (Gán ghế vào Ticket Type):** Trong Seat Map Editor, Organizer chọn từng ghế, hàng ghế hoặc nhóm ghế rồi gán vào Ticket Type tương ứng. Backend lưu lựa chọn này vào `event_seats.ticket_type_id`. FE dùng `ticket_types.color_code` hoặc snapshot `event_seats.color_code` để tô màu vùng ghế.
+4.  **Bước 4 (Publish & Auto-Sync Inventory):** Khi publish, hệ thống sync `event_seat_inventory.ticket_type_id` từ `event_seats.ticket_type_id` cho các ghế chưa phát sinh giao dịch:
     ```sql
-    UPDATE event_schema.event_seat_inventory
-    SET ticket_type_id = :ticketTypeId
-    WHERE event_seat_id IN (SELECT id FROM event_schema.event_seats WHERE sector_id = :sectorId)
-      AND (ticket_type_id IS NULL OR status IN ('AVAILABLE', 'BLOCKED'));
+    UPDATE event_schema.event_seat_inventory i
+    SET ticket_type_id = s.ticket_type_id
+    FROM event_schema.event_seats s
+    WHERE i.event_seat_id = s.id
+      AND s.sector_id = :sectorId
+      AND i.status IN ('AVAILABLE', 'BLOCKED');
     ```
-4.  **Bước 4 (Cập nhật UI Helper):** Hệ thống tự động ghi đè thông tin `map_data -> 'ticketTypeId'` trong bảng `event_sectors` để đồng bộ UI Editor.
+5.  **Bước 5 (Cập nhật UI Helper):** Hệ thống có thể lưu metadata hiển thị phụ trợ trong `event_seats.color_code` hoặc `coord_metadata`, nhưng source of truth nghiệp vụ vẫn là `event_seats.ticket_type_id`.
     > [!IMPORTANT]
-    > **Ignored FE mapData.ticketTypeId:** Khi Frontend thực hiện POST `/publish` sơ đồ ghế, Backend sẽ hoàn toàn bỏ qua hoặc ghi đè thuộc tính `mapData.ticketTypeId` được gửi lên từ client. Source of truth duy nhất để xác định loại vé của Sector luôn là liên kết quan hệ thực thể `TicketType.eventSectorId` trong database.
+    > **Không dùng `event_sectors.mapData.ticketTypeId` làm source of truth:** Một `SEATED` sector có thể chứa nhiều Ticket Type, nên Ticket Type không còn là thuộc tính của toàn sector. Source of truth để xác định ghế thuộc loại vé nào là `event_seats.ticket_type_id`.
     >
-    > **Publish sau khi đã liên kết Ticket Type:** Nếu sơ đồ ghế được chỉnh sửa và Publish lại sau khi Ticket Type đã được liên kết với Sector, Backend khi tạo các ghế mới sinh ra trong DB sẽ tự động điền `ticket_type_id` bằng ID của Ticket Type đang liên kết với Sector đó.
+    > **Publish sau khi đã bán vé:** Nếu ghế đã `RESERVED` hoặc `SOLD`, backend không được thay đổi `ticket_type_id` của ghế đó. Các ghế `AVAILABLE` hoặc `BLOCKED` được phép sync lại theo cấu hình mới.
 
 ### 4.2. Giới Hạn Nghiệp Vụ MVP (Sector vs Ticket Type)
-*   **MVP Constraint 1:** **Mỗi khán đài ghế ngồi (`SEATED` sector) chỉ được liên kết với tối đa 1 loại vé chọn chỗ (`ASSIGNED_SEAT` ticket type) ở trạng thái hoạt động (active).**
-    *   *Ý nghĩa:* Ngăn chặn việc cấu hình nhiều giá vé khác nhau trong cùng một khán đài vật lý mà không có phân lớp hàng ghế trong MVP.
-    *   *Giải pháp thay thế:* Nếu Organizer muốn cấu hình vé VIP ở các hàng đầu và Regular ở các hàng sau, họ phải vẽ tách thành 2 sector riêng biệt (ví dụ: `Khán đài A - VIP` và `Khán đài A - Regular`).
+*   **MVP Constraint 1:** **Một khán đài ghế ngồi (`SEATED` sector) được phép có nhiều `ASSIGNED_SEAT` Ticket Type, nhưng mỗi ghế active chỉ được gán đúng 1 Ticket Type.**
+    *   *Ý nghĩa:* `TicketType` kiêm vai trò vùng giá/hạng ghế trong MVP. Ví dụ cùng `Khán đài A` có thể có `VIP Ticket` và `Regular Ticket`, nhưng từng ghế A-01, A-02... phải được gán rõ vào một Ticket Type cụ thể.
+    *   *Không thêm `price_zone` trong MVP:* Bảng `price_zone` được hoãn lại. Khi cần tách vùng giá khỏi sản phẩm bán theo hướng enterprise hơn, có thể migrate từ `event_seats.ticket_type_id` sang `seat_price_zones`.
 *   **MVP Constraint 2 (Seated Quantity Derivation):** Khi Tạo hoặc Cập nhật Ticket Type có `inventoryMode = ASSIGNED_SEAT`, Backend sẽ **bỏ qua hoặc từ chối** trường `quantityTotal` gửi lên từ Client. Số lượng vé phát hành bắt buộc phải được lấy tự động từ số lượng ghế đang hoạt động của sector:
-    $$\text{quantityTotal} = \text{event\_seats.count(isActive = true, sectorId = eventSectorId)}$$
+    $$\text{quantityTotal} = \text{event\_seats.count(isActive = true, ticketTypeId = currentTicketTypeId)}$$
+*   **MVP Constraint 3 (Publish Readiness):** Trước khi event mở bán, mọi ghế active trong `SEATED` sector phải có `event_seats.ticket_type_id` hợp lệ. Nếu còn ghế active chưa gán Ticket Type, backend phải reject publish/sale-readiness để tránh buyer thấy ghế trống nhưng không có giá vé.
 
-### 4.3. Ràng Buộc Đổi Loại Vé Liên Kết của Seated Sector
-Để tránh làm sai lệch trạng thái ghế đã giữ hoặc đã bán của một sector khi thay đổi Ticket Type liên kết:
-*   **Quy tắc:** Trước khi thay đổi liên kết Ticket Type của một `SEATED` sector:
-    *   Nếu trong `event_seat_inventory` của sector đó đã tồn tại bất kỳ ghế nào ở trạng thái `RESERVED` hoặc `SOLD` $\rightarrow$ Hệ thống lập tức từ chối và trả lỗi HTTP 400 (`"Không thể thay đổi loại vé của khán đài khi đã phát sinh vé đặt hoặc vé bán"`).
-    *   Nếu toàn bộ ghế ở trạng thái `AVAILABLE` (hoặc `BLOCKED`, `NULL`) $\rightarrow$ Cho phép cập nhật lại `ticket_type_id` mới sang Ticket Type mới.
+### 4.3. Ràng Buộc Đổi Ticket Type Của Ghế
+Để tránh làm sai lệch trạng thái ghế đã giữ hoặc đã bán, mọi thay đổi `event_seats.ticket_type_id` phải tuân thủ:
+*   Nếu ghế đã có inventory ở trạng thái `RESERVED` hoặc `SOLD` $\rightarrow$ từ chối đổi Ticket Type của ghế đó và trả HTTP 400.
+*   Nếu ghế đang `AVAILABLE`, `BLOCKED` hoặc chưa có inventory $\rightarrow$ cho phép đổi Ticket Type, sau đó sync `event_seat_inventory.ticket_type_id`.
+*   Khi đổi Ticket Type của ghế, backend phải cập nhật counter theo delta:
+    *   Ticket Type cũ giảm `quantityTotal` và giảm `quantityAvailable` nếu ghế chưa bị giữ/bán.
+    *   Ticket Type mới tăng `quantityTotal` và tăng `quantityAvailable` nếu ghế chưa bị giữ/bán.
 
 ### 4.4. Định Nghĩa và Ràng Buộc Sức Chứa (Capacity Rules)
 
@@ -264,12 +302,12 @@ Frontend Buyer **chỉ cần kiểm tra trường `inventoryMode`** trong DTO tr
 *   **STANDING sectors không tạo dữ liệu trong bảng `event_seat_inventory`.**
 
 #### C. Đối với Khán Đài Ngồi (Access Scope = SECTOR, SectorType = SEATED)
-*   Giá trị `quantityTotal` của Ticket Type có `inventoryMode = ASSIGNED_SEAT` phải đồng bộ với số lượng ghế hoạt động (`isActive = true`) trong khán đài tương ứng.
+*   Giá trị `quantityTotal` của Ticket Type có `inventoryMode = ASSIGNED_SEAT` phải đồng bộ với số lượng ghế hoạt động (`isActive = true`) đang gán vào chính Ticket Type đó qua `event_seats.ticket_type_id`.
 *   **Công thức Safe-Sync khi Publish Sơ đồ sau khi mở bán:**
-    *   Lấy số lượng ghế hoạt động hiện tại trên sơ đồ: `activeSeatCount`.
-    *   Đếm số lượng ghế đã bán trong DB: `soldCount = count(event_seat_inventory where status = 'SOLD' for sector)`.
-    *   Đếm số lượng ghế đang giữ trong DB: `reservedCount = count(event_seat_inventory where status = 'RESERVED' for sector)`.
-    *   Nếu `activeSeatCount < soldCount + reservedCount` $\rightarrow$ Trả lỗi HTTP 400 và chặn Publish (`"Không thể cập nhật sơ đồ vì số ghế hoạt động nhỏ hơn lượng ghế đã bán và đang giữ chỗ"`).
+    *   Với mỗi Ticket Type trong `SEATED` sector, lấy `activeSeatCount = count(event_seats where is_active = true and ticket_type_id = currentTicketTypeId)`.
+    *   Đếm số lượng ghế đã bán trong DB: `soldCount = count(event_seat_inventory where status = 'SOLD' and ticket_type_id = currentTicketTypeId)`.
+    *   Đếm số lượng ghế đang giữ trong DB: `reservedCount = count(event_seat_inventory where status = 'RESERVED' and ticket_type_id = currentTicketTypeId)`.
+    *   Nếu `activeSeatCount < soldCount + reservedCount` $\rightarrow$ Trả lỗi HTTP 400 và chặn Publish (`"Không thể cập nhật sơ đồ vì số ghế hoạt động của loại vé nhỏ hơn lượng ghế đã bán và đang giữ chỗ"`).
     *   Nếu hợp lệ, Backend tự động cập nhật:
         *   `TicketType.quantityTotal = activeSeatCount`
         *   `TicketType.quantityAvailable = activeSeatCount - soldCount - reservedCount`
@@ -329,8 +367,8 @@ Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa tr
 *   `BookingService` chịu trách nhiệm mở rộng Transaction, điều phối gọi các pha của Strategy, gọi `TicketInventoryCounterService` và lưu thông tin `Order` gốc.
 *   Các Strategy tự quản lý cơ chế khóa (Lock), xác thực sau khóa (Pre-check), và lưu giữ chi tiết chỗ (Record). Không được thiết kế một phương thức `book()` tổng nuốt chửng cả luồng nghiệp vụ của `BookingService`.
 
-### 6.1. Cơ chế Khóa Toàn Cục Tránh Deadlock trên Mixed Order
-Để tránh hiện tượng deadlock/circular wait khi một đơn hàng chứa cả vé số lượng (Zone Lock) và vé chọn ghế (Seat Lock), chúng ta thiết lập cơ chế **Sắp xếp khóa toàn cục (Global Lock Ordering)**:
+### 6.1. Cơ chế Khóa Toàn Cục Tránh Deadlock trên nhiều Lock
+Phase B chỉ cho phép một booking request thuộc một vùng bán, nên không có mixed-zone order trong MVP. Tuy vậy một order seated vẫn có thể khóa nhiều ghế cùng lúc, và hướng mở rộng sau này có thể cho phép nhiều vùng trong cùng cart. Vì vậy vẫn thiết lập cơ chế **Sắp xếp khóa toàn cục (Global Lock Ordering)**:
 1.  **Thu thập toàn bộ Lock Keys của Đơn hàng:**
     *   Với mỗi item đặt vé số lượng (Fanzone/GA): Tạo key `lock:zone:{ticketTypeId}`
     *   Với mỗi ghế ngồi đặt cụ thể: Tạo key `lock:seat:{eventId}:{seatId}`
@@ -371,6 +409,7 @@ Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa tr
   "inventoryMode": "ASSIGNED_SEAT",
   "accessScope": "SECTOR",
   "eventSectorId": "a823e20e-c21b-43d9-a292-96420556e9c4",
+  "colorCode": "#D4AF37",
   "quantityAvailable": 148
 }
 ```
@@ -382,7 +421,16 @@ Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa tr
   "sectorType": "STANDING",
   "totalCapacity": 500,
   "isActive": true,
-  "seatsData": []
+  "seatsData": [
+    {
+      "id": "c3809e2e-2a94-4d8b-967a-1153a5c531d0",
+      "label": "A-01",
+      "ticketTypeId": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+      "price": 1200000,
+      "colorCode": "#D4AF37",
+      "inventoryStatus": "AVAILABLE"
+    }
+  ]
 }
 ```
 
@@ -406,7 +454,18 @@ Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa tr
       "visible": true,
       "displayOrder": 1,
       "totalCapacity": 500,
-      "seats": []
+      "seats": [
+        {
+          "id": "c3809e2e-2a94-4d8b-967a-1153a5c531d0",
+          "rowName": "A",
+          "seatNumber": "01",
+          "seatLabel": "A-01",
+          "x": 120,
+          "y": 240,
+          "ticketTypeId": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+          "colorCode": "#D4AF37"
+        }
+      ]
     }
   ]
 }
@@ -434,8 +493,10 @@ Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa tr
 *   **Validation & Rejection Rules tại Backend:**
     *   **Chống trùng lặp Request:** Reject nếu cùng một `seatId` xuất hiện nhiều hơn một lần trong cùng một Request Payload.
     *   **Chống trùng lặp Item:** Reject nếu cùng một `ticketTypeId` xuất hiện ở nhiều item khác nhau trong mảng `items`. Giao diện hoặc Controller phải gom nhóm/merge trước khi gọi Service xử lý.
+    *   **Giới hạn một zone mỗi booking trong MVP:** Reject nếu request chứa các item thuộc nhiều `eventSectorId`/zone khác nhau. Với event không sơ đồ (`accessScope = EVENT`), toàn bộ item phải cùng là EVENT-level. Không cho trộn EVENT-level, STANDING sector và SEATED sector trong một order ở Phase B.
     *   **Kiểm tra phạm vi sự kiện:** Reject nếu bất kỳ `seatId` nào không thuộc về `eventId` đang đặt.
     *   **Kiểm tra phạm vi khán đài:** Reject nếu `seatId` không thuộc về `eventSectorId` liên kết với `ticketTypeId` tương ứng.
+    *   **Kiểm tra loại vé của ghế:** Reject nếu `event_seats.ticket_type_id` hoặc snapshot `event_seat_inventory.ticket_type_id` của ghế không khớp với `ticketTypeId` trong request.
     *   **Kiểm tra trạng thái ghế:** Reject nếu trạng thái ghế hiện tại khác `AVAILABLE` (ví dụ: `RESERVED`, `SOLD`, `BLOCKED`, `LOCKED` từ Redisson).
 
 ---
@@ -443,7 +504,7 @@ Hệ thống điều phối xử lý qua `InventoryReservationStrategy` dựa tr
 ## 8. Chi Tiết Cấu Hình Cache & Lock Phân Tán
 
 ### 8.1. Lock Spec (Phòng Deadlock & Livelock)
-*   **Lexicographical Sorting:** Trước khi acquire lock cho danh sách ghế, Java code bắt buộc phải sort danh sách `seatIds` theo thứ tự bảng chữ cái UUID string.
+*   **Lexicographical Sorting:** Trước khi acquire lock, Java code bắt buộc phải gom toàn bộ lock key của request rồi sort theo thứ tự bảng chữ cái. Với MVP một-zone-mỗi-booking, danh sách lock đơn giản hơn nhưng vẫn phải giữ nguyên quy tắc sort để tránh deadlock khi một booking có nhiều ghế.
 *   **Wait & Lease Duration:**
     *   `waitTime = 100ms` (Tránh treo luồng Tomcat, chống flaky test do trễ mạng hoặc hạ tầng quá tải).
     *   `leaseTime = 15s` (Tự động giải phóng khóa nếu Node xử lý bị crash đột ngột).
@@ -572,7 +633,7 @@ Hệ thống phải vượt qua 4 bộ Acceptance Criteria dưới đây:
 *   **When:** Request đặt ghế `A-01`.
 *   **Then:** Ghế `A-01` chuyển sang `RESERVED` trong DB và Redis cache. Một bản ghi được insert vào `order_item_seats` với `seat_id` khớp ID ghế, `price` khớp giá vé thực tế, và `status = 'RESERVED'`. Khi hết 15 phút không thanh toán, ghế tự động trả về `AVAILABLE`.
 
-### AC-4: Đặt vé Mixed (Hỗn hợp cả Standing và Seated)
-*   **Given:** Buyer đặt 1 vé Standing Fanzone (Quantity = 1) và 1 vé Seated (Quantity = 1, Seat = `B-05`) trong cùng một đơn hàng.
-*   **When:** Trực tiếp checkout.
-*   **Then:** Hệ thống khóa phân tán thành công cho ghế `B-05`, đồng thời trừ counter cho cả hai loại vé. Sinh 1 bản ghi ghế `B-05` trong `order_item_seats`, vé Fanzone không sinh ghế.
+### AC-4: Reject Mixed-Zone Booking trong Phase B
+*   **Given:** Buyer đặt 1 vé Standing Fanzone (Quantity = 1) và 1 vé Seated (Quantity = 1, Seat = `B-05`) trong cùng một request checkout.
+*   **When:** Gửi request booking.
+*   **Then:** Hệ thống reject với lỗi 400 vì Phase B chỉ cho phép một booking request thuộc một vùng bán. Buyer phải checkout từng vùng riêng hoặc FE phải tách thành các lần đặt riêng.
