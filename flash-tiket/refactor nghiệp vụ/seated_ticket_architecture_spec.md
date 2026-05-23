@@ -219,6 +219,9 @@ Sau khi sơ đồ được publish, Organizer tạo Ticket Type:
     *   Nếu khu vực được chọn là `SEATED` $\rightarrow$ Backend tự gán `inventoryMode = ASSIGNED_SEAT`. Organizer có thể tạo nhiều Ticket Type trong cùng một khán đài ngồi để đại diện cho các vùng giá/hạng ghế khác nhau (ví dụ VIP, Regular, Balcony). Trường **Số lượng vé** bị khóa (read-only), hệ thống tự động tính từ số ghế active đang gán vào Ticket Type đó.
     *   Mỗi Ticket Type nên có `colorCode`; FE dùng màu này để tô các ghế đang gán với Ticket Type. `event_seats.color_code` chỉ là snapshot/helper để lần sau reload map nhanh và nhất quán.
 
+> [!NOTE]
+> Frontend cần có vị trí cấu hình giới hạn mua vé cho Organizer. Tối thiểu gồm: **số vé tối đa mỗi đơn hàng** ở cấp Event (`events.max_tickets_per_order`), **số vé tối đa mỗi đơn hàng cho từng Ticket Type** (`ticket_types.max_per_order`), và một trường nghiệp vụ **số vé tối đa mỗi user được đặt/mua** nếu Phase B bổ sung giới hạn theo user. Các giới hạn này phải được hiển thị bằng ngôn ngữ nghiệp vụ dễ hiểu, ví dụ "Tối đa mỗi đơn" và "Tối đa mỗi người mua", không hiển thị tên kỹ thuật như `max_per_order`.
+
 #### D. Bảng ánh xạ UX → Backend
 
 | Organizer chọn trên UI | `eventSectorId` | Backend tự gán `accessScope` | Backend tự gán `inventoryMode` |
